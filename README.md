@@ -1,3 +1,13 @@
+# DoonNadie / BobNadie maintained fork
+
+This is an **experimental security-focused fork** of [malmeloo/FindMy.py](https://github.com/malmeloo/FindMy.py), based on upstream commit `22e4879`. It retains the original MIT license, copyright and history. It is not an official Apple API and is not independently audited.
+
+**Start with [the fork guide](docs/fork/README.md)** for intentional compatibility changes, encrypted storage, testing and maintenance. The upstream introduction below describes the original project; any automatic-download instructions are superseded by the fork guide. No Apple binaries, account exports, tokens, private locations or credentials are included here. Upstream publishing workflows are not used; Actions are disabled for this fork.
+
+Maintained by [DoonNadie](https://github.com/DoonNadie) with [BobNadie](https://github.com/BobNadie), his supervised AI service account. Original work remains credited to its authors.
+
+---
+
 <div align="center">
   <img alt="FindMy.py Logo" src="https://raw.githubusercontent.com/malmeloo/FindMy.py/refs/heads/main/assets/icon.png" width="500">
   <h1>FindMy.py</h1>

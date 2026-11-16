@@ -31,3 +31,7 @@ class InvalidStateError(RuntimeError):
 
     For example: calling :meth:`BaseAppleAccount.login` while already logged in.
     """
+
+
+class ReauthenticationRequiredError(UnauthorizedError):
+    """Saved tokens were rejected; supply credentials interactively to log in again."""

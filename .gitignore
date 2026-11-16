@@ -165,3 +165,14 @@ airtag.plist
 DO_NOT_COMMIT*
 .direnv/
 accessories/
+
+# Never commit account state, key stores or provisioning exports.
+state/
+private/
+*.aesgcm
+*.keychain-db
+reports_session*.json
+device-profile*.toml
+keystore.plist
+keychain_state.plist
+local-ani/

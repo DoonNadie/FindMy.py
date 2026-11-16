@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 from typing import Any, TypedDict, cast
+from urllib.parse import urlsplit
 
 import aiohttp
 from aiohttp import BasicAuth, ClientSession, ClientTimeout
@@ -63,7 +65,7 @@ class HttpResponse:
         """Response content as a dict, obtained by Plist-decoding the response content."""
         data = decode_plist(self._content)
         if not isinstance(data, dict):
-            msg = f"Unknown Plist-encoded data type: {data}. This is a bug, please report it."
+            msg = "Unexpected Plist response type (response content omitted)."
             raise TypeError(msg)
 
         return data
@@ -72,7 +74,10 @@ class HttpResponse:
 class HttpSession(Closable):
     """Asynchronous HTTP session manager. For internal use only."""
 
-    def __init__(self, *, verify_tls: bool = True) -> None:
+    def __init__(
+        self, *, verify_tls: bool = True, apple_only: bool = False,
+        allow_insecure_http: bool = False, max_response_bytes: int = 64 * 1024 * 1024,
+    ) -> None:
         """
         Initialize the session.
 
@@ -88,6 +93,13 @@ class HttpSession(Closable):
 
         self._session: ClientSession | None = None
         self._closed: bool = False
+        if apple_only and (not verify_tls or allow_insecure_http):
+            raise ValueError("Apple sessions require verified HTTPS")
+        if max_response_bytes <= 0:
+            raise ValueError("Response limit must be positive")
+        self._apple_only = apple_only
+        self._allow_insecure_http = allow_insecure_http
+        self._max_response_bytes = max_response_bytes
         self._ssl = tls_setting(verify=verify_tls)
 
     async def _get_session(self) -> ClientSession:
@@ -130,12 +142,26 @@ class HttpSession(Closable):
 
         Keyword arguments will directly be passed to :meth:`aiohttp.ClientSession.request`.
         """
+        # Validate before opening a session or sending credential-bearing data.
+        self.validate_url(url)
         session = await self._get_session()
 
         # cast from http options to library supported options
         auth = kwargs.pop("auth", None)
-        if isinstance(auth, tuple):
-            kwargs["auth"] = BasicAuth(auth[0], auth[1])
+        if auth is not None:
+            if isinstance(auth, tuple):
+                if ":" in auth[0]:
+                    raise ValueError("Basic authentication username cannot contain a colon")
+                encoded_auth = "Basic " + base64.b64encode(
+                    (auth[0] + ":" + auth[1]).encode("latin1")
+                ).decode("ascii")
+            else:
+                encoded_auth = auth.encode()
+            headers = dict(kwargs.get("headers") or {})
+            if any(name.lower() == "authorization" for name in headers):
+                raise ValueError("Specify either auth or Authorization, not both")
+            headers["Authorization"] = encoded_auth
+            kwargs["headers"] = headers
         options = cast("_AiohttpRequestOptions", kwargs)
 
         auto_retry = kwargs.pop("auto_retry", False)
@@ -147,23 +173,50 @@ class HttpSession(Closable):
                     method,
                     url,
                     ssl=self._ssl,
+                    allow_redirects=False,
                     raise_for_status=auto_retry,
                     **options,
                 ) as r:
-                    return HttpResponse(r.status, await r.content.read())
+                    if 300 <= r.status < 400:
+                        raise ValueError("HTTP redirects are not permitted")
+                    content = bytearray()
+                    async for chunk in r.content.iter_chunked(65536):
+                        content.extend(chunk)
+                        if len(content) > self._max_response_bytes:
+                            raise ValueError("HTTP response exceeds size limit")
+                    return HttpResponse(r.status, bytes(content))
             except aiohttp.ClientError as e:  # noqa: PERF203
                 if not auto_retry or retry_count > 3:
-                    raise e from None
+                    raise RuntimeError("HTTP transport failed (" + type(e).__name__ + ")") from None
 
                 retry_after = 5 * retry_count
                 logger.warning(
-                    "Error while making HTTP request; retrying after %i seconds. %s",
+                    "HTTP request failed; retrying after %i seconds (%s)",
                     retry_after,
-                    e,
+                    type(e).__name__,
                 )
                 await asyncio.sleep(retry_after)
 
                 retry_count += 1
+
+    def validate_url(self, url: str) -> None:
+        """Reject unsafe destinations without logging URLs or credential values."""
+        try:
+            parts = urlsplit(url)
+            host = parts.hostname or ""
+            port = parts.port
+        except ValueError:
+            raise ValueError("Invalid HTTP destination") from None
+        schemes = {"https", "http"} if self._allow_insecure_http else {"https"}
+        if (parts.scheme not in schemes or not host or parts.username is not None
+                or parts.password is not None or parts.fragment
+                or any(ord(c) <= 32 or ord(c) == 127 for c in url)):
+            raise ValueError("HTTP destination requires HTTPS without userinfo or fragments")
+        if self._apple_only and (port not in (None, 443) or not any(
+            host == domain or host.endswith("." + domain)
+            for domain in ("apple.com", "icloud.com")
+        )):
+            raise ValueError("Destination is outside the Apple service allowlist")
 
     async def get(self, url: str, **kwargs: Unpack[_HttpRequestOptions]) -> HttpResponse:
         """Alias for `HttpSession.request("GET", ...)`."""

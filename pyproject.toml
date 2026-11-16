@@ -1,9 +1,10 @@
 [project]
 name = "FindMy"
-version = "0.10.2"
+version = "0.10.2+doonnadie.1"
 description = "Query the location of your FindMy devices with Python!"
 readme = "README.md"
 authors = [{ name = "Mike Almeloo", email = "git@mikealmel.ooo" }]
+maintainers = [{ name = "DoonNadie" }, { name = "BobNadie (supervised AI service account)" }]
 license-files = ["LICENSE.md"]
 requires-python = ">=3.10,<3.15"
 dependencies = [
@@ -13,7 +14,7 @@ dependencies = [
     "aiohttp>=3.9.5,<4.0.0",
     "bleak>=3.0.2,<3.1.0",
     "typing-extensions>=4.12.2,<5.0.0",
-    "anisette>=1.2.4,<2.0.0",
+    "anisette==1.2.4",
 ]
 
 [dependency-groups]
@@ -85,8 +86,8 @@ ignore = [
     "PLC0415", # import not on top of file
 ]
 
-[tool.setuptools]
-packages = ["findmy"]
+[tool.setuptools.packages.find]
+include = ["findmy", "findmy.*"]
 
 [build-system]
 requires = ["setuptools", "setuptools-scm"]

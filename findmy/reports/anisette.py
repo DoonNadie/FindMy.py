@@ -9,6 +9,8 @@ import locale
 import logging
 import time
 from abc import ABC, abstractmethod
+from collections.abc import Awaitable, Callable
+from contextlib import ExitStack
 from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
@@ -58,7 +60,7 @@ def get_provider_from_mapping(
         return RemoteAnisetteProvider.from_json(mapping)
     if mapping["type"] == "aniLocal":
         return LocalAnisetteProvider.from_json(mapping, libs_path=libs_path)
-    msg = f"Unknown anisette type: {mapping['type']}"
+    msg = "Unknown or external Anisette provider; supply a provider explicitly"
     raise ValueError(msg)
 
 
@@ -149,6 +151,8 @@ class BaseAnisetteProvider(util.abc.Closable, util.abc.Serializable, ABC):
 
         Consider using :meth:`BaseAppleAccount.get_anisette_headers` instead.
         """
+        if not self.otp or not self.machine:
+            raise ValueError("Anisette identity is incomplete; refusing authentication")
         headers = {
             # Current Time
             "X-Apple-I-Client-Time": self.timestamp,
@@ -175,6 +179,16 @@ class BaseAnisetteProvider(util.abc.Closable, util.abc.Serializable, ABC):
             headers["X-Apple-App-Info"] = "com.apple.gs.xcode.auth"
             headers["X-Xcode-Version"] = "11.2 (11B41)"
 
+        return headers
+
+    async def get_mobileme_headers(self, user_id: str, device_id: str) -> dict[str, str]:
+        """Build delegate headers; providers may preserve a coherent native identity."""
+        headers = {
+            "User-Agent": "com.apple.iCloudHelper/282 CFNetwork/1408.0.4 Darwin/22.5.0",
+            "X-Mme-Client-Info": "<MacBookPro18,3> <Mac OS X;13.4.1;22F8>"
+            " <com.apple.AOSKit/282 (com.apple.accountsd/113)>",
+        }
+        headers.update(await self.get_headers(user_id, device_id))
         return headers
 
     async def get_cpd(
@@ -294,7 +308,7 @@ class RemoteAnisetteProvider(BaseAnisetteProvider, util.abc.Serializable[RemoteA
             raise RuntimeError(msg)
 
         if self._anisette_data is None or time.time() >= self._anisette_data_expires_at:
-            logger.info("Fetching anisette data from %s", self._server_url)
+            logger.info("Fetching remote Anisette data")
 
             r = await self._http.get(self._server_url, auto_retry=True)
             self._anisette_data = r.json()
@@ -347,16 +361,8 @@ class LocalAnisetteProvider(BaseAnisetteProvider, util.abc.Serializable[LocalAni
         if self._ani is not None:
             return self._ani
 
-        if self._libs_path is None or not self._libs_path.is_file():
-            logger.info(
-                "The Anisette engine will download libraries required for operation, "
-                "this may take a few seconds...",
-            )
-        if self._libs_path is None:
-            logger.info(
-                "To speed up future local Anisette initializations, "
-                "provide a filesystem path to load the libraries from.",
-            )
+        if self._libs_path is None or not self._libs_path.is_file() or self._libs_path.is_symlink():
+            raise ValueError("Provide a reviewed local Anisette library file; downloads are disabled")
 
         files: list[BinaryIO | Path] = []
         if self._state_blob is not None:
@@ -365,11 +371,22 @@ class LocalAnisetteProvider(BaseAnisetteProvider, util.abc.Serializable[LocalAni
             files.append(self._libs_path)
 
         loop = asyncio.get_running_loop()
-        ani = await loop.run_in_executor(None, Anisette.load, *files)
-        is_provisioned = await loop.run_in_executor(None, lambda: ani.is_provisioned)
+        def load_local() -> Anisette:
+            # Anisette 1.2.x's public load() silently downloads missing libraries.
+            # Supply a fail-closed fallback directly instead (version-bound adapter).
+            from anisette._ani_provider import AnisetteProvider
 
-        if self._libs_path is not None:
-            ani.save_libs(self._libs_path)
+            def no_download() -> object:
+                raise RuntimeError("Implicit Anisette library downloads are disabled")
+
+            with ExitStack() as stack:
+                streams = [stack.enter_context(f.open("rb")) if isinstance(f, Path) else f
+                           for f in files]
+                provider = AnisetteProvider.load(*streams, fs_fallback=no_download)
+            return Anisette(provider)
+
+        ani = await loop.run_in_executor(None, load_local)
+        is_provisioned = await loop.run_in_executor(None, lambda: ani.is_provisioned)
 
         if not self._is_new_session and not is_provisioned:
             logger.warning(
@@ -466,3 +483,78 @@ class LocalAnisetteProvider(BaseAnisetteProvider, util.abc.Serializable[LocalAni
     @override
     async def close(self) -> None:
         """See :meth:`BaseAnisetteProvider.close`."""
+
+
+class ExternalAnisetteProvider(BaseAnisetteProvider):
+    """Use an explicit caller-supplied async header loader, preserving its identity.
+
+    No subprocess, server, download or secret persistence is performed by this provider.
+    Restore account state by supplying this provider explicitly to AsyncAppleAccount.
+    The caller is responsible for reviewing its loader and storing state securely.
+    """
+
+    def __init__(self, loader: Callable[[], Awaitable[dict[str, str]]], *, user_agent: str) -> None:
+        super().__init__()
+        self._loader = loader
+        self._headers: dict[str, str] = {}
+        self._user_agent = user_agent
+        if not user_agent or any(ord(c) < 32 or ord(c) == 127 for c in user_agent):
+            raise ValueError("Invalid user agent")
+
+    @property
+    def otp(self) -> str:
+        return self._headers.get("X-Apple-I-MD", "")
+
+    @property
+    def machine(self) -> str:
+        return self._headers.get("X-Apple-I-MD-M", "")
+
+    @property
+    def client(self) -> str:
+        return self._headers.get("X-Mme-Client-Info", "")
+
+    async def get_headers(self, user_id: str, device_id: str, serial: str = "0",
+                          with_client_info: bool = False) -> dict[str, str]:
+        raw = await self._loader()
+        if not isinstance(raw, dict):
+            raise ValueError("External Anisette loader must return a header mapping")
+        canonical = {
+            name.lower(): name for name in (
+                "X-Apple-I-MD", "X-Apple-I-MD-M", "X-Apple-I-MD-LU",
+                "X-Apple-I-MD-RINFO", "X-Mme-Device-Id", "X-Mme-Client-Info",
+                "X-Apple-I-Client-Time", "X-Apple-I-TimeZone", "X-Apple-Locale",
+                "X-Apple-I-SRL-NO", "loc",
+            )
+        }
+        headers: dict[str, str] = {}
+        for name, value in raw.items():
+            if not isinstance(name, str) or not isinstance(value, str):
+                raise ValueError("Invalid external Anisette headers")
+            key = canonical.get(name.lower())
+            if key is None:
+                # Do not let a loader inject Authorization, Host, cookies or account IDs.
+                raise ValueError("Unexpected external Anisette header")
+            if key in headers or not value or len(value) > 4096 or any(ord(c) < 32 or ord(c) == 127 for c in value):
+                raise ValueError("Empty, duplicate or invalid external Anisette header")
+            headers[key] = value
+        required = ("X-Apple-I-MD", "X-Apple-I-MD-M", "X-Apple-I-MD-LU",
+                    "X-Mme-Device-Id", "X-Mme-Client-Info")
+        if any(key not in headers for key in required):
+            raise ValueError("External Anisette identity is incomplete")
+        self._headers = headers
+        return dict(headers)
+
+    async def get_mobileme_headers(self, user_id: str, device_id: str) -> dict[str, str]:
+        headers = await self.get_headers(user_id, device_id)
+        headers["User-Agent"] = self._user_agent
+        return headers
+
+    def to_json(self, dst: str | Path | io.TextIOBase | None = None, /) -> dict:
+        return util.files.save_and_return_json({"type": "external"}, dst)
+
+    @classmethod
+    def from_json(cls, val: object) -> ExternalAnisetteProvider:
+        raise ValueError("Supply an explicit trusted header loader when restoring account state")
+
+    async def close(self) -> None:
+        self._headers.clear()

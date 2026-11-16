@@ -32,6 +32,7 @@ from findmy.errors import (
     EmptyResponseError,
     InvalidCredentialsError,
     InvalidStateError,
+    ReauthenticationRequiredError,
     UnauthorizedError,
     UnhandledProtocolError,
 )
@@ -365,7 +366,7 @@ class AsyncAppleAccount(BaseAppleAccount):
 
         # TODO: combine, user/pass should be "all or nothing"  # noqa: TD002, TD003
         self._username: str | None = state_info["account"]["username"] if state_info else None
-        self._password: str | None = state_info["account"]["password"] if state_info else None
+        self._password: str | None = None  # Never restore a password from serialized state.
 
         self._login_state: LoginState = (
             LoginState(state_info["login"]["state"]) if state_info else LoginState.LOGGED_OUT
@@ -376,7 +377,7 @@ class AsyncAppleAccount(BaseAppleAccount):
             state_info["account"]["info"] if state_info else None
         )
 
-        self._http: util.http.HttpSession = util.http.HttpSession()
+        self._http: util.http.HttpSession = util.http.HttpSession(apple_only=True)
         self._reports: LocationReportsFetcher = LocationReportsFetcher(self)
         self._closed: bool = False
 
@@ -437,12 +438,19 @@ class AsyncAppleAccount(BaseAppleAccount):
 
     @override
     def to_json(self, path: str | Path | io.TextIOBase | None = None, /) -> AccountStateMapping:
+        """Export sensitive token state, never a raw password; encrypt before persistence.
+
+        Supplying a path still writes plaintext JSON for upstream API compatibility.
+        Use save_encrypted instead for encrypted storage. A restored account does not
+        retain a password for automatic reauthentication.
+        """
+        # Raw passwords are intentionally excluded, including legacy restored passwords.
         res: AccountStateMapping = {
             "type": "account",
             "ids": {"uid": self._uid, "devid": self._devid},
             "account": {
                 "username": self._username,
-                "password": self._password,
+                "password": None,  # Tokens are still secrets; encrypt the returned state.
                 "info": self._account_info,
             },
             "login": {
@@ -453,6 +461,18 @@ class AsyncAppleAccount(BaseAppleAccount):
         }
 
         return util.files.save_and_return_json(res, path)
+
+    def save_encrypted(self, store: object, name: str = "account.json") -> None:
+        """Save token state using a caller-configured EncryptedStateStore."""
+        from findmy.storage import EncryptedStateStore
+
+        if not isinstance(store, EncryptedStateStore):
+            raise TypeError("An EncryptedStateStore is required")
+        store.write_json(name, self.to_json())
+
+    def forget_password(self) -> None:
+        """Drop the in-memory password reference; this does not promise memory erasure."""
+        self._password = None
 
     @classmethod
     @override
@@ -470,7 +490,7 @@ class AsyncAppleAccount(BaseAppleAccount):
             ani_provider = get_provider_from_mapping(val["anisette"], libs_path=anisette_libs_path)
             return cls(ani_provider, state_info=val)
         except KeyError as e:
-            msg = f"Failed to restore account data: {e}"
+            msg = "Failed to restore account data (details omitted)"
             raise ValueError(msg) from None
 
     @override
@@ -489,12 +509,12 @@ class AsyncAppleAccount(BaseAppleAccount):
         try:
             await self._anisette.close()
         except (RuntimeError, OSError, ConnectionError) as e:
-            logger.warning("Error closing anisette provider: %s", e)
+            logger.warning("Error closing anisette provider (%s)", type(e).__name__)
 
         try:
             await self._http.close()
         except (RuntimeError, OSError, ConnectionError) as e:
-            logger.warning("Error closing HTTP session: %s", e)
+            logger.warning("Error closing HTTP session (%s)", type(e).__name__)
 
     @_require_login_state(LoginState.LOGGED_OUT)
     @override
@@ -691,6 +711,10 @@ class AsyncAppleAccount(BaseAppleAccount):
         if r.status_code == 401:
             logger.info("Got 401 while fetching reports, redoing login")
 
+            if not self._password:
+                raise ReauthenticationRequiredError(
+                    "Apple rejected the saved session; interactive login is required."
+                )
             new_state = await self._gsa_authenticate()
             if new_state != LoginState.AUTHENTICATED:
                 msg = f"Unexpected login state after reauth: {new_state}. Please log in again."
@@ -708,7 +732,7 @@ class AsyncAppleAccount(BaseAppleAccount):
         except json.JSONDecodeError:
             resp = {}
         if not r.ok or resp.get("acsnLocations", {}).get("statusCode") != "200":
-            msg = f"Failed to fetch reports: {resp.get('statusCode')}"
+            msg = "Apple returned an unsuccessful report response"
             raise UnhandledProtocolError(msg)
 
         # parse reports
@@ -801,7 +825,7 @@ class AsyncAppleAccount(BaseAppleAccount):
         self._username = username or self._username
         self._password = password or self._password
 
-        logger.info("Attempting authentication for user %s", self._username)
+        logger.info("Attempting Apple account authentication")
 
         if not self._username or not self._password:
             msg = "No username or password specified"
@@ -818,11 +842,11 @@ class AsyncAppleAccount(BaseAppleAccount):
         logger.debug("Verifying response to auth request")
 
         if r["Status"].get("ec") != 0:
-            msg = "Email verification failed: " + r["Status"].get("em")
+            msg = "Apple rejected the initial authentication request"
             raise InvalidCredentialsError(msg)
         sp = r.get("sp")
         if not isinstance(sp, str) or sp not in {"s2k", "s2k_fo"}:
-            msg = f"This implementation only supports s2k and sk2_fo. Server returned {sp}"
+            msg = "Apple returned an unsupported password challenge protocol"
             raise UnhandledProtocolError(msg)
 
         logger.debug("Attempting password challenge")
@@ -839,7 +863,7 @@ class AsyncAppleAccount(BaseAppleAccount):
         logger.debug("Verifying password challenge response")
 
         if r["Status"].get("ec") != 0:
-            msg = "Password authentication failed: " + r["Status"].get("em")
+            msg = "Apple rejected the password authentication request"
             raise InvalidCredentialsError(msg)
         usr.verify_session(r.get("M2"))
         if not usr.authenticated():
@@ -885,7 +909,7 @@ class AsyncAppleAccount(BaseAppleAccount):
                 {"idms_pet": idms_pet, "adsid": spd["adsid"]},
             )
 
-        msg = f"Unknown auth value: {au}"
+        msg = "Apple returned an unsupported authentication state"
         raise UnhandledProtocolError(msg)
 
     @_require_login_state(LoginState.AUTHENTICATED)
@@ -900,13 +924,8 @@ class AsyncAppleAccount(BaseAppleAccount):
             },
         )
 
-        headers = {
-            "X-Apple-ADSID": self._login_state_data["adsid"],
-            "User-Agent": "com.apple.iCloudHelper/282 CFNetwork/1408.0.4 Darwin/22.5.0",
-            "X-Mme-Client-Info": "<MacBookPro18,3> <Mac OS X;13.4.1;22F8>"
-            " <com.apple.AOSKit/282 (com.apple.accountsd/113)>",
-        }
-        headers.update(await self.get_anisette_headers())
+        headers = await self._anisette.get_mobileme_headers(self._uid, self._devid)
+        headers["X-Apple-ADSID"] = self._login_state_data["adsid"]
 
         resp = await self._http.post(
             self._ENDPOINT_LOGIN_MOBILEME,
@@ -916,13 +935,27 @@ class AsyncAppleAccount(BaseAppleAccount):
         )
         data = resp.plist()
 
-        mobileme_data = data.get("delegates", {}).get("com.apple.mobileme", {})
-        status = mobileme_data.get("status") or data.get("status")
-        if status != 0:
-            status_message = mobileme_data.get("status-message") or data.get("status-message")
-            msg = f"com.apple.mobileme login failed with status {status}: {status_message}"
+        delegates = data.get("delegates", {})
+        if not isinstance(delegates, dict):
+            raise UnhandledProtocolError("Invalid Apple delegate response structure")
+        mobileme_data = delegates.get("com.apple.mobileme", {})
+        if not isinstance(mobileme_data, dict):
+            raise UnhandledProtocolError("Invalid Apple delegate response structure")
+        status = mobileme_data.get("status")
+        if status is None:
+            status = data.get("status")
+        if type(status) is not int or status != 0:
+            # Arbitrary server text can contain account data; expose only numeric status.
+            safe_status = status if type(status) is int else "unknown"
+            msg = f"com.apple.mobileme login failed with status {safe_status}"
             raise UnhandledProtocolError(msg)
 
+        service_data = mobileme_data.get("service-data")
+        tokens = service_data.get("tokens") if isinstance(service_data, dict) else None
+        token = tokens.get("searchPartyToken") if isinstance(tokens, dict) else None
+        if (not isinstance(token, str) or not token
+                or not isinstance(data.get("dsid"), (str, int))):
+            raise UnhandledProtocolError("Apple delegate response is missing session data")
         return self._set_login_state(
             LoginState.LOGGED_IN,
             {"dsid": data["dsid"], "mobileme_data": mobileme_data["service-data"]},
@@ -1073,7 +1106,7 @@ class AppleAccount(BaseAppleAccount):
             ani_provider = get_provider_from_mapping(val["anisette"], libs_path=anisette_libs_path)
             return cls(ani_provider, state_info=val)
         except KeyError as e:
-            msg = f"Failed to restore account data: {e}"
+            msg = "Failed to restore account data (details omitted)"
             raise ValueError(msg) from None
 
     @override
