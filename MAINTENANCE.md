@@ -21,12 +21,12 @@ Date: 2026-11-16. This is an experimental maintained fork, not an audited produc
 ## Change and acceptance gate
 
 1. Define the defect/risk, scope and acceptance criterion.
-2. Work in a separate checkout/environment. Preserve the known-working code and encrypted recovery material; exclude all private state from Git.
+2. Work in a separate checkout/environment. Preserve known-working code from this maintained fork and encrypted recovery material; exclude all private state from Git.
 3. Review source/dependencies before any installation. The owner explicitly approves new third-party installations/updates under the deployment's policy.
 4. Run the relevant offline regressions, including password exclusion, invalid tokens, delegate response handling, TLS/redirect policy, header validation and ciphertext/path manipulation.
 5. If needed for this specific query-library change, perform one owner-authorized query with the existing session. Do not force fresh login/2FA, exporter runs or changes to iCloud trust to test maintenance.
 6. Compare output format, session serialization compatibility, reports and permissions. Fresh login and all supported platforms are separate acceptance scopes, not implied by a saved-session test.
-7. Deploy an explicit versioned snapshot, not a mutable branch. Validate its manifest/import origin and preserve the previous runtime/launcher.
+7. Deploy an explicit versioned snapshot, not a mutable branch. Validate its manifest/import origin and preserve an accepted version of this maintained fork when needed for recovery.
 8. Verify the normal entrypoint after switching. Update version record, changelog, operation notes and recovery instructions.
 
 ## Failure handling and rollback
@@ -35,7 +35,7 @@ Date: 2026-11-16. This is an experimental maintained fork, not an audited produc
 - **Keychain unavailable / bad hash / authentication tag failure:** stop. No plaintext fallback or automatic re-pinning.
 - **Network/protocol error:** keep previous state/results separate from the failed new query; never present cached coordinates as a current report.
 - **Applicable critical vulnerability:** evaluate actual exposure promptly during the review/incident; stop only the affected component when no safe mitigation exists. This plan is not continuous CVE monitoring.
-- Roll back **code and routing**, not tokens, provisioning or trust-circle records automatically. Keep the current encrypted state if compatible. Restore old secret state only through a deliberate reviewed recovery procedure.
+- Recovery uses a reviewed accepted version of **this maintained fork**, not an automatic fallback to the original upstream client. Change code and routing only, not tokens, provisioning or trust-circle records automatically. Keep the current encrypted state if compatible. Restore old secret state only through a deliberate reviewed recovery procedure.
 - Keep the official Find My application as an alternative. Never weaken TLS or disable SIP to make the unofficial client work.
 
 ## Ownership and boundaries
@@ -47,3 +47,7 @@ Anisette 1.2.4 is pinned because the no-download adapter uses a private API; a d
 Encrypted storage protects at rest, not against the same user/root, malicious filesystem races, rollback/deletion or loss of both ciphertext and key. Copies are not a recovery plan unless the key is recoverable too. This fork's optional encrypted store is not an automatic migration of another application's vault.
 
 GitHub Actions remain disabled in this fork. The plan does not authorize automatic publication, PyPI releases or arbitrary public changes.
+
+## Owner deployment policy update — 2026-11-16
+
+The owner chose to retire the previous upstream client and its rollback entrypoint. The deployment now installs this maintained fork, while the query entrypoint still verifies an explicit source snapshot. Shared dependencies, encrypted state and recovery data are retained. If a defect appears, reproduce it, add a regression and repair the maintained fork; do not automatically reinstall the retired client. Historical Git provenance and MIT attribution remain intact.
