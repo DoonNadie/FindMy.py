@@ -51,3 +51,22 @@ GitHub Actions remain disabled in this fork. The plan does not authorize automat
 ## Owner deployment policy update — 2026-11-16
 
 The owner chose to retire the previous upstream client and its rollback entrypoint. The deployment now installs this maintained fork, while the query entrypoint still verifies an explicit source snapshot. Shared dependencies, encrypted state and recovery data are retained. If a defect appears, reproduce it, add a regression and repair the maintained fork; do not automatically reinstall the retired client. Historical Git provenance and MIT attribution remain intact.
+
+## Report freshness diagnostics
+
+Use `python examples/report_freshness.py current.json --previous previous.json`
+to compare two successful local queries offline. The input format is
+`{"queried_at":"2026-01-01T12:00:00+00:00","results":[{"name":"Example","timestamp":"2026-01-01T11:55:00+00:00"}]}`.
+Use timezone-aware timestamps and a stable, unique name for each accessory.
+A missing or null report timestamp means no report was returned. Omit
+`--previous` when no baseline is available. Age is relative to the successful
+query time, not the publication delay or proof of a live location. Do not
+commit real query files or diagnostic output.
+
+The official app may show a location not available to the report client when
+an accessory is near an owner's device ([upstream #276](https://github.com/malmeloo/FindMy.py/issues/276)).
+Alignment can also exclude recent reports ([#273](https://github.com/malmeloo/FindMy.py/issues/273),
+[#274](https://github.com/malmeloo/FindMy.py/issues/274)). An offline check
+confirmed that an index beyond the calculated ceiling is excluded; this
+does not establish the cause of any particular missing report. No alignment
+or transport behavior was changed.
