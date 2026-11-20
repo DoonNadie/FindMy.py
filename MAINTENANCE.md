@@ -70,3 +70,10 @@ Alignment can also exclude recent reports ([#273](https://github.com/malmeloo/Fi
 confirmed that an index beyond the calculated ceiling is excluded; this
 does not establish the cause of any particular missing report. No alignment
 or transport behavior was changed.
+
+The example also summarizes optional per-accessory coverage from
+`diagnostics.reports`: requested lookback days, report count, attempted
+batches and failed batches. A failed batch marks the result incomplete.
+The requested window is not proof of complete coverage. For offline
+reproductions of the alignment cases, run
+`python -m unittest discover -s tests -p test_report_alignment.py`.
